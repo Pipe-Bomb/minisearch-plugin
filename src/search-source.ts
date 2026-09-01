@@ -302,7 +302,7 @@ export class PipeBombSearchSource implements SearchSource {
 			}
 		}
 
-		index.addAll(docs);
+		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
@@ -335,7 +335,7 @@ export class PipeBombSearchSource implements SearchSource {
 			}
 		}
 
-		index.addAll(docs);
+		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
@@ -394,7 +394,7 @@ export class PipeBombSearchSource implements SearchSource {
 			await processCurrentBatch();
 		}
 
-		index.addAll(docs);
+		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
