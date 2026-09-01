@@ -1,0 +1,7 @@
+{
+	"plugin.minisearch.name": "MiniSearch",
+	"sort.plugin.minisearch.search.title.name": "Title",
+	"sort.plugin.minisearch.search.date-added.name": "Date added",
+	"sort.plugin.minisearch.search.artist.name": "Artist name",
+	"task.plugin.minisearch.build-index.name": "Build index"
+}
