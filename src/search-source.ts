@@ -18,6 +18,57 @@ import {
 import MiniSearch from "minisearch";
 
 const BATCH_SIZE = 100;
+const SORT_YIELD_MS = 50;
+
+async function yieldingSort<T>(
+	arr: T[],
+	compare: (a: T, b: T) => number,
+): Promise<void> {
+	const n = arr.length;
+	if (n <= 1) {
+		return;
+	}
+	const buf = new Array<T>(n);
+	let deadline = Date.now() + SORT_YIELD_MS;
+
+	for (let width = 1; width < n; width <<= 1) {
+		for (let lo = 0; lo < n; lo += width << 1) {
+			const mid = Math.min(lo + width, n);
+			const hi = Math.min(lo + (width << 1), n);
+			let i = lo,
+				j = mid,
+				k = lo;
+			while (i < mid && j < hi) {
+				buf[k++] = compare(arr[i]!, arr[j]!) <= 0 ? arr[i++]! : arr[j++]!;
+				if ((k & 0x3fff) === 0 && Date.now() >= deadline) {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					deadline = Date.now() + SORT_YIELD_MS;
+				}
+			}
+			while (i < mid) {
+				buf[k++] = arr[i++]!;
+				if ((k & 0x3fff) === 0 && Date.now() >= deadline) {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					deadline = Date.now() + SORT_YIELD_MS;
+				}
+			}
+			while (j < hi) {
+				buf[k++] = arr[j++]!;
+				if ((k & 0x3fff) === 0 && Date.now() >= deadline) {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					deadline = Date.now() + SORT_YIELD_MS;
+				}
+			}
+			for (let p = lo; p < hi; p++) {
+				arr[p] = buf[p]!;
+				if ((p & 0x3fff) === 0 && Date.now() >= deadline) {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					deadline = Date.now() + SORT_YIELD_MS;
+				}
+			}
+		}
+	}
+}
 const REINDEX_INTERVAL_MS = 15 * 60 * 1000;
 
 interface ArtistDoc {
@@ -251,12 +302,15 @@ export class PipeBombSearchSource implements SearchSource {
 		this.indexing = true;
 		try {
 			onProgress?.(0);
-			const artistResult = await this.indexArtists();
-			onProgress?.(30);
-			const albumResult = await this.indexAlbums();
-			onProgress?.(60);
-			const trackResult = await this.indexTracks();
-			onProgress?.(90);
+			const artistResult = await this.indexArtists((p) =>
+				onProgress?.(p * 0.1),
+			);
+			const albumResult = await this.indexAlbums((p) =>
+				onProgress?.(0.1 + p * 0.2),
+			);
+			const trackResult = await this.indexTracks((p) =>
+				onProgress?.(0.3 + p * 0.6),
+			);
 
 			this.artistIndex = artistResult.index;
 			this.artistData = artistResult.data;
@@ -265,8 +319,8 @@ export class PipeBombSearchSource implements SearchSource {
 			this.trackIndex = trackResult.index;
 			this.trackData = trackResult.data;
 
-			this.buildSortedArrays();
-			onProgress?.(100);
+			await this.buildSortedArrays(onProgress);
+			onProgress?.(1);
 
 			this.logger.log(
 				`Index built: ${this.artistData.size} artists, ` +
@@ -279,14 +333,12 @@ export class PipeBombSearchSource implements SearchSource {
 		}
 	}
 
-	private async indexArtists(): Promise<{
+	private async indexArtists(onProgress?: (p: number) => void): Promise<{
 		index: MiniSearch<ArtistDoc>;
 		data: Map<string, ArtistData>;
 	}> {
 		const index = makeMiniSearch<ArtistDoc>(["name"]);
 		const data = new Map<string, ArtistData>();
-		const docs: ArtistDoc[] = [];
-
 		const count = await this.dataClient.getArtistCount();
 
 		for (let offset = 0; offset < count; offset += BATCH_SIZE) {
@@ -295,25 +347,25 @@ export class PipeBombSearchSource implements SearchSource {
 				relations: { attributes: true },
 			});
 
+			const docs: ArtistDoc[] = [];
 			for (const artist of artists) {
 				const name = getStringAttr(artist.attributes, "name");
 				docs.push({ id: artist.uuid, name });
 				data.set(artist.uuid, { name, dateAdded: artist.dateAdded });
 			}
+			await index.addAllAsync(docs, { chunkSize: 50 });
+			onProgress?.(Math.min(1, (offset + BATCH_SIZE) / count));
 		}
 
-		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
-	private async indexAlbums(): Promise<{
+	private async indexAlbums(onProgress?: (p: number) => void): Promise<{
 		index: MiniSearch<AlbumDoc>;
 		data: Map<string, AlbumData>;
 	}> {
 		const index = makeMiniSearch<AlbumDoc>(["title", "artist"]);
 		const data = new Map<string, AlbumData>();
-		const docs: AlbumDoc[] = [];
-
 		const count = await this.dataClient.getAlbumCount();
 
 		for (let offset = 0; offset < count; offset += BATCH_SIZE) {
@@ -325,6 +377,7 @@ export class PipeBombSearchSource implements SearchSource {
 				},
 			});
 
+			const docs: AlbumDoc[] = [];
 			for (const album of albums) {
 				const title = getStringAttr(album.attributes, "title");
 				const artist = album.artists
@@ -333,21 +386,30 @@ export class PipeBombSearchSource implements SearchSource {
 				docs.push({ id: album.uuid, title, artist });
 				data.set(album.uuid, { title, artist, dateAdded: album.dateAdded });
 			}
+			await index.addAllAsync(docs, { chunkSize: 50 });
+			onProgress?.(Math.min(1, (offset + BATCH_SIZE) / count));
 		}
 
-		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
-	private async indexTracks(): Promise<{
+	private async indexTracks(onProgress?: (p: number) => void): Promise<{
 		index: MiniSearch<TrackDoc>;
 		data: Map<string, TrackData>;
 	}> {
 		const index = makeMiniSearch<TrackDoc>(["title", "artist"]);
 		const data = new Map<string, TrackData>();
-		const docs: TrackDoc[] = [];
-
 		const libraryIds = this.dataClient.getLibraryHandlerIds();
+
+		const total =
+			(
+				await Promise.all(
+					libraryIds.map(({ pluginId, libraryId }) =>
+						this.dataClient.getTrackCount(pluginId, libraryId),
+					),
+				)
+			).reduce((sum, n) => sum + n, 0) || 1;
+		let done = 0;
 
 		for (const { pluginId, libraryId } of libraryIds) {
 			const batch: { pluginId: string; libraryId: string; trackId: string }[] =
@@ -365,6 +427,7 @@ export class PipeBombSearchSource implements SearchSource {
 					},
 				});
 
+				const docs: TrackDoc[] = [];
 				for (const track of tracks) {
 					const title = getStringAttr(track.attributes, "title") || track.title;
 					const artist = track.artists
@@ -374,6 +437,9 @@ export class PipeBombSearchSource implements SearchSource {
 					data.set(track.uuid, { title, artist, dateAdded: track.dateAdded });
 				}
 
+				await index.addAllAsync(docs, { chunkSize: 50 });
+				done += docs.length;
+				onProgress?.(Math.min(1, done / total));
 				batch.length = 0;
 				batchUuids.length = 0;
 			};
@@ -394,48 +460,67 @@ export class PipeBombSearchSource implements SearchSource {
 			await processCurrentBatch();
 		}
 
-		await index.addAllAsync(docs, { chunkSize: 100 });
 		return { index, data };
 	}
 
-	private buildSortedArrays(): void {
-		this.artistsByName = [...this.artistData.entries()]
-			.sort(([, a], [, b]) => a.name.localeCompare(b.name))
-			.map(([uuid]) => uuid);
+	private async buildSortedArrays(
+		onProgress?: (percent: number) => void,
+	): Promise<void> {
+		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+		let step = 0;
+		const report = (): void => {
+			onProgress?.(0.9 + ++step * 0.0125);
+		};
 
-		this.artistsByDate = [...this.artistData.entries()]
-			.sort(([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime())
-			.map(([uuid]) => uuid);
+		const artistEntries = [...this.artistData.entries()];
+		await yieldingSort(artistEntries, ([, a], [, b]) => cmp(a.name, b.name));
+		this.artistsByName = artistEntries.map(([uuid]) => uuid);
+		report();
 
-		this.albumsByTitle = [...this.albumData.entries()]
-			.sort(([, a], [, b]) => a.title.localeCompare(b.title))
-			.map(([uuid]) => uuid);
+		await yieldingSort(
+			artistEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.artistsByDate = artistEntries.map(([uuid]) => uuid);
+		report();
 
-		this.albumsByArtist = [...this.albumData.entries()]
-			.sort(
-				([, a], [, b]) =>
-					a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
-			)
-			.map(([uuid]) => uuid);
+		const albumEntries = [...this.albumData.entries()];
+		await yieldingSort(albumEntries, ([, a], [, b]) => cmp(a.title, b.title));
+		this.albumsByTitle = albumEntries.map(([uuid]) => uuid);
+		report();
 
-		this.albumsByDate = [...this.albumData.entries()]
-			.sort(([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime())
-			.map(([uuid]) => uuid);
+		await yieldingSort(
+			albumEntries,
+			([, a], [, b]) => cmp(a.artist, b.artist) || cmp(a.title, b.title),
+		);
+		this.albumsByArtist = albumEntries.map(([uuid]) => uuid);
+		report();
 
-		this.tracksByTitle = [...this.trackData.entries()]
-			.sort(([, a], [, b]) => a.title.localeCompare(b.title))
-			.map(([uuid]) => uuid);
+		await yieldingSort(
+			albumEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.albumsByDate = albumEntries.map(([uuid]) => uuid);
+		report();
 
-		this.tracksByArtist = [...this.trackData.entries()]
-			.sort(
-				([, a], [, b]) =>
-					a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
-			)
-			.map(([uuid]) => uuid);
+		const trackEntries = [...this.trackData.entries()];
+		await yieldingSort(trackEntries, ([, a], [, b]) => cmp(a.title, b.title));
+		this.tracksByTitle = trackEntries.map(([uuid]) => uuid);
+		report();
 
-		this.tracksByDate = [...this.trackData.entries()]
-			.sort(([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime())
-			.map(([uuid]) => uuid);
+		await yieldingSort(
+			trackEntries,
+			([, a], [, b]) => cmp(a.artist, b.artist) || cmp(a.title, b.title),
+		);
+		this.tracksByArtist = trackEntries.map(([uuid]) => uuid);
+		report();
+
+		await yieldingSort(
+			trackEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.tracksByDate = trackEntries.map(([uuid]) => uuid);
+		report();
 	}
 
 	private resolveEntity(
@@ -529,7 +614,6 @@ export class PipeBombSearchSource implements SearchSource {
 					return true;
 				}
 
-				// track
 				const d = this.trackData.get(uuid);
 				if (!d) {
 					return false;
@@ -579,7 +663,6 @@ export class PipeBombSearchSource implements SearchSource {
 				: [...this.albumsByTitle].reverse();
 		}
 
-		// track
 		if (key === "artist") {
 			return dir === "asc"
 				? this.tracksByArtist
@@ -634,7 +717,6 @@ export class PipeBombSearchSource implements SearchSource {
 				return aD.title.localeCompare(bD.title) * dir;
 			}
 
-			// track
 			const aD = this.trackData.get(a);
 			const bD = this.trackData.get(b);
 			if (!aD || !bD) {
