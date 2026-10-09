@@ -152,6 +152,26 @@ function makeMiniSearch<T extends ArtistDoc | AlbumDoc | TrackDoc>(
 	});
 }
 
+function upsertIndex<T extends { id: string }>(
+	index: MiniSearch<T>,
+	doc: T,
+): void {
+	if (index.has(doc.id)) {
+		index.replace(doc);
+	} else {
+		index.add(doc);
+	}
+}
+
+function discardFromIndex<T extends { id: string }>(
+	index: MiniSearch<T>,
+	id: string,
+): void {
+	if (index.has(id)) {
+		index.discard(id);
+	}
+}
+
 export class MiniSearchSearchSource implements SearchSource {
 	readonly id = "search";
 
@@ -311,6 +331,7 @@ export class MiniSearchSearchSource implements SearchSource {
 
 	updateTracks(tracks: SavedTrack[]): void {
 		if (tracks.length === 0) {
+			this.logger.debug("[index] updateTracks: nothing to update");
 			return;
 		}
 		for (const track of tracks) {
@@ -318,7 +339,10 @@ export class MiniSearchSearchSource implements SearchSource {
 			const artist = track.artists
 				? joinArtistNames(track.artists as SavedArtistTrack[])
 				: "";
-			this.trackIndex.replace({ id: track.uuid, title, artist });
+			this.logger.debug(
+				`[index] updateTracks: ${track.uuid} title="${title}" artist="${artist}"`,
+			);
+			upsertIndex(this.trackIndex, { id: track.uuid, title, artist });
 			this.trackData.set(track.uuid, {
 				title,
 				artist,
@@ -326,6 +350,9 @@ export class MiniSearchSearchSource implements SearchSource {
 			});
 		}
 		this.trackSortedDirty = true;
+		this.logger.debug(
+			`[index] updateTracks: applied ${tracks.length} doc(s), total=${this.trackData.size}`,
+		);
 	}
 
 	deleteTracks(uuids: string[]): void {
@@ -334,27 +361,38 @@ export class MiniSearchSearchSource implements SearchSource {
 		}
 		const removed = new Set(uuids);
 		for (const uuid of removed) {
-			this.trackIndex.discard(uuid);
+			this.logger.debug(`[index] deleteTracks: ${uuid}`);
+			discardFromIndex(this.trackIndex, uuid);
 			this.trackData.delete(uuid);
 		}
 		this.tracksByTitle = this.tracksByTitle.filter((u) => !removed.has(u));
 		this.tracksByArtist = this.tracksByArtist.filter((u) => !removed.has(u));
 		this.tracksByDate = this.tracksByDate.filter((u) => !removed.has(u));
+		this.logger.debug(
+			`[index] deleteTracks: removed ${uuids.length} doc(s), total=${this.trackData.size}`,
+		);
 	}
 
 	updateArtists(artists: SavedArtist[]): void {
 		if (artists.length === 0) {
+			this.logger.debug("[index] updateArtists: nothing to update");
 			return;
 		}
 		for (const artist of artists) {
 			const name = getStringAttr(artist.attributes, "name");
-			this.artistIndex.replace({ id: artist.uuid, name });
+			this.logger.debug(
+				`[index] updateArtists: ${artist.uuid} name="${name}"`,
+			);
+			upsertIndex(this.artistIndex, { id: artist.uuid, name });
 			this.artistData.set(artist.uuid, {
 				name,
 				dateAdded: artist.dateAdded,
 			});
 		}
 		this.artistSortedDirty = true;
+		this.logger.debug(
+			`[index] updateArtists: applied ${artists.length} doc(s), total=${this.artistData.size}`,
+		);
 	}
 
 	deleteArtists(uuids: string[]): void {
@@ -363,15 +401,20 @@ export class MiniSearchSearchSource implements SearchSource {
 		}
 		const removed = new Set(uuids);
 		for (const uuid of removed) {
-			this.artistIndex.discard(uuid);
+			this.logger.debug(`[index] deleteArtists: ${uuid}`);
+			discardFromIndex(this.artistIndex, uuid);
 			this.artistData.delete(uuid);
 		}
 		this.artistsByName = this.artistsByName.filter((u) => !removed.has(u));
 		this.artistsByDate = this.artistsByDate.filter((u) => !removed.has(u));
+		this.logger.debug(
+			`[index] deleteArtists: removed ${uuids.length} doc(s), total=${this.artistData.size}`,
+		);
 	}
 
 	updateAlbums(albums: SavedAlbum[]): void {
 		if (albums.length === 0) {
+			this.logger.debug("[index] updateAlbums: nothing to update");
 			return;
 		}
 		for (const album of albums) {
@@ -379,7 +422,10 @@ export class MiniSearchSearchSource implements SearchSource {
 			const artist = album.artists
 				? joinArtistNames(album.artists as SavedAlbumArtist[])
 				: "";
-			this.albumIndex.replace({ id: album.uuid, title, artist });
+			this.logger.debug(
+				`[index] updateAlbums: ${album.uuid} title="${title}" artist="${artist}"`,
+			);
+			upsertIndex(this.albumIndex, { id: album.uuid, title, artist });
 			this.albumData.set(album.uuid, {
 				title,
 				artist,
@@ -387,6 +433,9 @@ export class MiniSearchSearchSource implements SearchSource {
 			});
 		}
 		this.albumSortedDirty = true;
+		this.logger.debug(
+			`[index] updateAlbums: applied ${albums.length} doc(s), total=${this.albumData.size}`,
+		);
 	}
 
 	deleteAlbums(uuids: string[]): void {
@@ -395,15 +444,22 @@ export class MiniSearchSearchSource implements SearchSource {
 		}
 		const removed = new Set(uuids);
 		for (const uuid of removed) {
-			this.albumIndex.discard(uuid);
+			this.logger.debug(`[index] deleteAlbums: ${uuid}`);
+			discardFromIndex(this.albumIndex, uuid);
 			this.albumData.delete(uuid);
 		}
 		this.albumsByTitle = this.albumsByTitle.filter((u) => !removed.has(u));
 		this.albumsByArtist = this.albumsByArtist.filter((u) => !removed.has(u));
 		this.albumsByDate = this.albumsByDate.filter((u) => !removed.has(u));
+		this.logger.debug(
+			`[index] deleteAlbums: removed ${uuids.length} doc(s), total=${this.albumData.size}`,
+		);
 	}
 
 	async flushSorted(): Promise<void> {
+		this.logger.debug(
+			`[index] flushSorted: artists=${this.artistSortedDirty} albums=${this.albumSortedDirty} tracks=${this.trackSortedDirty}`,
+		);
 		if (this.artistSortedDirty) {
 			await this.rebuildArtistSorted();
 			this.artistSortedDirty = false;
@@ -425,6 +481,7 @@ export class MiniSearchSearchSource implements SearchSource {
 			return;
 		}
 		this.indexing = true;
+		this.logger.debug("[index] full rebuild started");
 		this.rebuildListener?.onRebuildStart();
 		try {
 			onProgress?.(0);
@@ -456,6 +513,7 @@ export class MiniSearchSearchSource implements SearchSource {
 			this.logger.error("Failed to build search index:", err);
 		} finally {
 			this.indexing = false;
+			this.logger.debug("[index] full rebuild finished");
 			this.rebuildListener?.onRebuildEnd();
 		}
 	}
@@ -653,6 +711,9 @@ export class MiniSearchSearchSource implements SearchSource {
 	private async rebuildArtistSorted(): Promise<void> {
 		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
+		this.logger.debug(
+			`[index] rebuilding artist sorted arrays (n=${this.artistData.size})`,
+		);
 		const artistEntries = [...this.artistData.entries()];
 		await yieldingSort(artistEntries, ([, a], [, b]) => cmp(a.name, b.name));
 		this.artistsByName = artistEntries.map(([uuid]) => uuid);
@@ -667,6 +728,9 @@ export class MiniSearchSearchSource implements SearchSource {
 	private async rebuildAlbumSorted(): Promise<void> {
 		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
+		this.logger.debug(
+			`[index] rebuilding album sorted arrays (n=${this.albumData.size})`,
+		);
 		const albumEntries = [...this.albumData.entries()];
 		await yieldingSort(albumEntries, ([, a], [, b]) => cmp(a.title, b.title));
 		this.albumsByTitle = albumEntries.map(([uuid]) => uuid);
@@ -687,6 +751,9 @@ export class MiniSearchSearchSource implements SearchSource {
 	private async rebuildTrackSorted(): Promise<void> {
 		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
+		this.logger.debug(
+			`[index] rebuilding track sorted arrays (n=${this.trackData.size})`,
+		);
 		const trackEntries = [...this.trackData.entries()];
 		await yieldingSort(trackEntries, ([, a], [, b]) => cmp(a.title, b.title));
 		this.tracksByTitle = trackEntries.map(([uuid]) => uuid);
