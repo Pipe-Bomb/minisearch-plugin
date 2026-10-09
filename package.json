@@ -17,7 +17,7 @@
 		"node": "24.14.1"
 	},
 	"dependencies": {
-		"@pipe-bomb/plugin-sdk": "file:../../sdk",
+		"@pipe-bomb/plugin-sdk": "^0.4.0",
 		"minisearch": "^7.1.1"
 	}
 }
