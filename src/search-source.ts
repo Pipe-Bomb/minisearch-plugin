@@ -1,9 +1,12 @@
 import {
 	DataClient,
 	Logger,
+	SavedAlbum,
 	SavedAlbumArtist,
+	SavedArtist,
 	SavedArtistTrack,
 	SavedAttribute,
+	SavedTrack,
 	SearchEntityQuery,
 	SearchFilter,
 	SearchQuery,
@@ -70,6 +73,11 @@ async function yieldingSort<T>(
 	}
 }
 const REINDEX_INTERVAL_MS = 15 * 60 * 1000;
+
+export interface RebuildListener {
+	onRebuildStart(): void;
+	onRebuildEnd(): void;
+}
 
 interface ArtistDoc {
 	id: string;
@@ -144,7 +152,7 @@ function makeMiniSearch<T extends ArtistDoc | AlbumDoc | TrackDoc>(
 	});
 }
 
-export class PipeBombSearchSource implements SearchSource {
+export class MiniSearchSearchSource implements SearchSource {
 	readonly id = "search";
 
 	private dataClient: DataClient;
@@ -168,6 +176,14 @@ export class PipeBombSearchSource implements SearchSource {
 	private tracksByDate: string[] = [];
 
 	private indexing = false;
+	private artistSortedDirty = false;
+	private albumSortedDirty = false;
+	private trackSortedDirty = false;
+	private rebuildListener: RebuildListener | null = null;
+
+	setRebuildListener(listener: RebuildListener): void {
+		this.rebuildListener = listener;
+	}
 
 	constructor(dataClient: DataClient, logger: Logger) {
 		this.dataClient = dataClient;
@@ -293,6 +309,115 @@ export class PipeBombSearchSource implements SearchSource {
 		await this.rebuildIndex(onProgress);
 	}
 
+	updateTracks(tracks: SavedTrack[]): void {
+		if (tracks.length === 0) {
+			return;
+		}
+		for (const track of tracks) {
+			const title = getStringAttr(track.attributes, "title") || track.title;
+			const artist = track.artists
+				? joinArtistNames(track.artists as SavedArtistTrack[])
+				: "";
+			this.trackIndex.replace({ id: track.uuid, title, artist });
+			this.trackData.set(track.uuid, {
+				title,
+				artist,
+				dateAdded: track.dateAdded,
+			});
+		}
+		this.trackSortedDirty = true;
+	}
+
+	deleteTracks(uuids: string[]): void {
+		if (uuids.length === 0) {
+			return;
+		}
+		const removed = new Set(uuids);
+		for (const uuid of removed) {
+			this.trackIndex.discard(uuid);
+			this.trackData.delete(uuid);
+		}
+		this.tracksByTitle = this.tracksByTitle.filter((u) => !removed.has(u));
+		this.tracksByArtist = this.tracksByArtist.filter((u) => !removed.has(u));
+		this.tracksByDate = this.tracksByDate.filter((u) => !removed.has(u));
+	}
+
+	updateArtists(artists: SavedArtist[]): void {
+		if (artists.length === 0) {
+			return;
+		}
+		for (const artist of artists) {
+			const name = getStringAttr(artist.attributes, "name");
+			this.artistIndex.replace({ id: artist.uuid, name });
+			this.artistData.set(artist.uuid, {
+				name,
+				dateAdded: artist.dateAdded,
+			});
+		}
+		this.artistSortedDirty = true;
+	}
+
+	deleteArtists(uuids: string[]): void {
+		if (uuids.length === 0) {
+			return;
+		}
+		const removed = new Set(uuids);
+		for (const uuid of removed) {
+			this.artistIndex.discard(uuid);
+			this.artistData.delete(uuid);
+		}
+		this.artistsByName = this.artistsByName.filter((u) => !removed.has(u));
+		this.artistsByDate = this.artistsByDate.filter((u) => !removed.has(u));
+	}
+
+	updateAlbums(albums: SavedAlbum[]): void {
+		if (albums.length === 0) {
+			return;
+		}
+		for (const album of albums) {
+			const title = getStringAttr(album.attributes, "title");
+			const artist = album.artists
+				? joinArtistNames(album.artists as SavedAlbumArtist[])
+				: "";
+			this.albumIndex.replace({ id: album.uuid, title, artist });
+			this.albumData.set(album.uuid, {
+				title,
+				artist,
+				dateAdded: album.dateAdded,
+			});
+		}
+		this.albumSortedDirty = true;
+	}
+
+	deleteAlbums(uuids: string[]): void {
+		if (uuids.length === 0) {
+			return;
+		}
+		const removed = new Set(uuids);
+		for (const uuid of removed) {
+			this.albumIndex.discard(uuid);
+			this.albumData.delete(uuid);
+		}
+		this.albumsByTitle = this.albumsByTitle.filter((u) => !removed.has(u));
+		this.albumsByArtist = this.albumsByArtist.filter((u) => !removed.has(u));
+		this.albumsByDate = this.albumsByDate.filter((u) => !removed.has(u));
+	}
+
+	async flushSorted(): Promise<void> {
+		if (this.artistSortedDirty) {
+			await this.rebuildArtistSorted();
+			this.artistSortedDirty = false;
+		}
+		if (this.albumSortedDirty) {
+			await this.rebuildAlbumSorted();
+			this.albumSortedDirty = false;
+		}
+		if (this.trackSortedDirty) {
+			await this.rebuildTrackSorted();
+			this.trackSortedDirty = false;
+		}
+	}
+
 	private async rebuildIndex(
 		onProgress?: (percent: number) => void,
 	): Promise<void> {
@@ -300,6 +425,7 @@ export class PipeBombSearchSource implements SearchSource {
 			return;
 		}
 		this.indexing = true;
+		this.rebuildListener?.onRebuildStart();
 		try {
 			onProgress?.(0);
 			const artistResult = await this.indexArtists((p) =>
@@ -330,6 +456,7 @@ export class PipeBombSearchSource implements SearchSource {
 			this.logger.error("Failed to build search index:", err);
 		} finally {
 			this.indexing = false;
+			this.rebuildListener?.onRebuildEnd();
 		}
 	}
 
@@ -521,6 +648,60 @@ export class PipeBombSearchSource implements SearchSource {
 		);
 		this.tracksByDate = trackEntries.map(([uuid]) => uuid);
 		report();
+	}
+
+	private async rebuildArtistSorted(): Promise<void> {
+		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+		const artistEntries = [...this.artistData.entries()];
+		await yieldingSort(artistEntries, ([, a], [, b]) => cmp(a.name, b.name));
+		this.artistsByName = artistEntries.map(([uuid]) => uuid);
+
+		await yieldingSort(
+			artistEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.artistsByDate = artistEntries.map(([uuid]) => uuid);
+	}
+
+	private async rebuildAlbumSorted(): Promise<void> {
+		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+		const albumEntries = [...this.albumData.entries()];
+		await yieldingSort(albumEntries, ([, a], [, b]) => cmp(a.title, b.title));
+		this.albumsByTitle = albumEntries.map(([uuid]) => uuid);
+
+		await yieldingSort(
+			albumEntries,
+			([, a], [, b]) => cmp(a.artist, b.artist) || cmp(a.title, b.title),
+		);
+		this.albumsByArtist = albumEntries.map(([uuid]) => uuid);
+
+		await yieldingSort(
+			albumEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.albumsByDate = albumEntries.map(([uuid]) => uuid);
+	}
+
+	private async rebuildTrackSorted(): Promise<void> {
+		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+		const trackEntries = [...this.trackData.entries()];
+		await yieldingSort(trackEntries, ([, a], [, b]) => cmp(a.title, b.title));
+		this.tracksByTitle = trackEntries.map(([uuid]) => uuid);
+
+		await yieldingSort(
+			trackEntries,
+			([, a], [, b]) => cmp(a.artist, b.artist) || cmp(a.title, b.title),
+		);
+		this.tracksByArtist = trackEntries.map(([uuid]) => uuid);
+
+		await yieldingSort(
+			trackEntries,
+			([, a], [, b]) => a.dateAdded.getTime() - b.dateAdded.getTime(),
+		);
+		this.tracksByDate = trackEntries.map(([uuid]) => uuid);
 	}
 
 	private resolveEntity(
